@@ -136,76 +136,9 @@ bendTableValue  EQU 0x42
         movf    STATUS,w          ; move status register into W register
         movwf   status_temp       ; save off contents of STATUS register
 
-isrCheckUart:
-        btfss   INTCON,T0IF
-        goto    isrCheckTone
-        bcf     INTCON,T0IF
-
-; Poll Serial Input
-        ; Check uartState
-        movf    uartState,f
-        btfss   STATUS,Z
-        goto    uartStopCheck
-        ; uartState==0, looking for start bit
-        btfss   SERIAL_INPUT
-        goto    uartStartFound
-             ; serialIn==1, check in 0.25 baud
-uartLoadQuarter:
-        movlw   BIT025_PRELOAD      ; if input is still high, check again in 1/4 baud
-uartLoadTimer:
-        addwf   TMR0,F          ; Add value to TMR0 counter, so it doesn't matter how late we are
-        movf    status_temp,w     ; retrieve copy of STATUS register
-        movwf   STATUS            ; restore pre-isr STATUS register contents
-        swapf   w_temp,f
-        swapf   w_temp,w          ; restore pre-isr W register contents
-        retfie                    ; return from interrupt
-        
-uartStartFound:
-        ; serialIn==0, start bit has started
-        clrf    uartData
-        clrf    uartDataReady
-        incf    uartState,f
-            ; center of first data bit is 1.25 to 1.5 baud from now
-;uartLoadThreeHalves:
-        movlw   BIT125_PRELOAD      ; if input is still high, check again in 1/4 baud
-        goto    uartLoadTimer
-
-uartStopCheck:
-        btfss   uartState,4
-        goto    uartBitShift
-        ; uartState==16, wait for stop bit to appear
-        btfsc   SERIAL_INPUT
-        clrf    uartState       ; stop bit HIGH detected, now safe to wait for start bit LOW
-        goto    uartLoadQuarter ; check for stop or start bit again in 1/4 baud
-
-uartBitShift:
-        ; uartState indicates waiting for a data bit
-        ; shift in the data from the input pin
-        bcf     STATUS,C
-        btfsc   SERIAL_INPUT
-        bsf     STATUS,C
-        rrf     uartData,f
-        ; check if we have 8 bits yet
-        btfsc   uartState,3
-        goto    uartByteDone
-        incf    uartState,f
-           ; Next bit (or stop bit) is one baud away
-;uartLoadFull:
-        movlw   BIT_PRELOAD      ; if input is still high, check again in 1/4 baud
-        goto    uartLoadTimer
-        
-uartByteDone:
-        bsf     uartDataReady,0 ; Indicate uart data is ready to be processed
-        movlw   0x10
-        movwf   uartState       ; Next wait for the line to go idle again
-                                  ; check frequently for the start of the stop bit
-        goto    uartLoadQuarter
-
-
-isrCheckTone:
         btfsc   INTCON,PEIE
         btfss   PIR1,TMR1IF
-        goto    isrDone
+        goto    isrCheckUart
 
         bcf     PIR1,TMR1IF
         
@@ -234,7 +167,68 @@ shortDelay:
         movwf   TMR1H
         ; Reenable TMR1
         bsf     T1CON,TMR1ON
+
+isrCheckUart:
+        btfss   INTCON,T0IF
+        goto    isrDone
+; Run the UART code
+
+;     ------------------------
+;         Poll Serial Input
+
+        bcf     INTCON,T0IF
+
+        ; Check uartState
+        movf    uartState,f
+        btfss   STATUS,Z
+        goto    uartStopCheck
+        ; uartState==0, wait for start bit
+        movlw   BIT025_PRELOAD      ; if input is still high, check again in 1/4 baud
+        btfsc   SERIAL_INPUT
+        goto    uartTimerLoad
+        ; serialIn==0, start bit has started
+        clrf    uartData
+        clrf    uartDataReady
+        incf    uartState,f
+        movlw   BIT125_PRELOAD      ; center of first data bit is 1.25 to 1.5 baud from now
+        goto    uartTimerLoad
+
+uartStopCheck:
+        btfss   uartState,4
+        goto    uartBitShift
+        ; uartState==16, wait for stop bit to appear
+        btfsc   SERIAL_INPUT
+        clrf    uartState       ; stop bit HIGH detected, now safe to wait for start bit LOW
+        movlw   BIT025_PRELOAD  ; check for stop or start bit again in 1/4 baud
+        goto    uartTimerLoad
+
+uartBitShift:
+        ; uartState indicates waiting for a data bit
+        ; shift in the data from the input pin
+        bcf     STATUS,C
+        btfsc   SERIAL_INPUT
+        bsf     STATUS,C
+        rrf     uartData,f
+        movlw   BIT_PRELOAD     ; Next bit (or stop bit) is one baud away
+        ; check if we have 8 bits yet
+        btfsc   uartState,3
+        goto    uartByteDone
+        incf    uartState,f
+        goto    uartTimerLoad
         
+uartByteDone:
+        bsf     uartDataReady,0 ; Indicate uart data is ready to be processed
+        movlw   0x10
+        movwf   uartState       ; Next wait for the line to go idle again
+        movlw   BIT025_PRELOAD  ; check frequently for the start of the stop bit
+        
+uartTimerLoad:
+        addwf   TMR0,F          ; Add value to TMR0 counter, so it doesn't matter how late we are
+        btfsc   STATUS,C        ; If we waited too long to load the timer, this will cause an overflow,
+        bsf     INTCON,T0IF     ;   so we flag that another loop should execute immediately
+;     ------------------------
+
+
 isrDone:
         movf    status_temp,w     ; retrieve copy of STATUS register
         movwf   STATUS            ; restore pre-isr STATUS register contents
