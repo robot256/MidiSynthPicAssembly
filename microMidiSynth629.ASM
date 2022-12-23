@@ -42,10 +42,10 @@
 
 
 ; GPIO Pin Mapping
-#define TONE_OUTPUT     GPIO,0
-#define TONE_OUTPUT_MASK 0x01
+#define TONE_OUTPUT     GPIO,2
+#define TONE_OUTPUT_MASK 0x04
 #define CMP_INPUT       GPIO,1
-#define TRIGGER_OUTPUT  GPIO,2
+#define TRIGGER_OUTPUT  GPIO,0
 #define SERIAL_INPUT    GPIO,3
 
 
@@ -100,7 +100,7 @@ tempPreloadH    EQU 0x32
 tableAddress    EQU 0x33
 
 noteBendValue   EQU 0x34
-;#define ARRAY_SIZE      8
+
 noteNumber      EQU 0x35        ; ID of the note currently playing (255=off)
 noteStack1      EQU 0x36
 noteStack2      EQU 0x37
@@ -110,8 +110,54 @@ noteStack5      EQU 0x3A
 noteStack6      EQU 0x3B
 noteStack7      EQU 0x3C
 
-        
+pitchBendCmdReady EQU   0x3D
+bendAmountL     EQU 0x3E
+bendAmountH     EQU 0x3F
+bendTempL       EQU 0x40
+bendTempH       EQU 0x41
+bendTableValue  EQU 0x42
+
+;#define TEST_NOTE_STACK
+
 ;***** MACRO DEFINITIONS
+
+
+; u2:u1 = u2:u1 - a2:a1
+sub16 MACRO a1,a2,u1,u2
+        movf    a1,w
+        subwf   u1,f
+        movf    a2,w
+        btfss   STATUS,C
+        incfsz  a2,w
+        subwf   u2,f 
+    ENDM
+
+; u2:u1 = u2:u1 + a2:a1
+add16 MACRO a1,a2,u1,u2
+        movf    a1,w
+        addwf   u1,f
+        movf    a2,w
+        btfsc   STATUS,C
+        incfsz  a2,w
+        addwf   u2,f
+    ENDM
+
+asr16 MACRO u1,u2
+        rlf     u2,w
+        rrf     u2,f
+        rrf     u1,f
+    ENDM
+
+negmac16 MACRO a,ab,b1,b2,u1,u2
+        btfss   a,ab
+        goto    $+7
+        add16   b1,b2,u1,u2
+    ENDM
+
+negmac16r MACRO a,ab,b1,b2,u1,u2
+        negmac16 a,ab,b1,b2,u1,u2
+        asr16 b1,b2
+    ENDM
 
 
 ;**********************************************************************
@@ -130,8 +176,10 @@ noteStack7      EQU 0x3C
         movf    STATUS,w          ; move status register into W register
         movwf   status_temp       ; save off contents of STATUS register
 
+        btfsc   INTCON,PEIE
+        btfss   PIR1,TMR1IF
+        goto    isrCheckUart
 
-        ; Only interrupt used is TMR1
         bcf     PIR1,TMR1IF
         
         ; Toggle the frequency output
@@ -147,12 +195,9 @@ noteStack7      EQU 0x3C
         andwf   GPIO,w
         btfsc   STATUS,Z
         goto    shortDelay
-        ; long delay
-        goto    shortDelay
+        nop
+        nop
 shortDelay:
-        nop
-        nop
-        nop
         nop
         
         ; Load the TMR1 preload value
@@ -163,6 +208,68 @@ shortDelay:
         ; Reenable TMR1
         bsf     T1CON,TMR1ON
 
+isrCheckUart:
+        btfss   INTCON,T0IF
+        goto    isrDone
+; Run the UART code
+
+;     ------------------------
+;         Poll Serial Input
+
+        bcf     INTCON,T0IF
+
+        ; Check uartState
+        movf    uartState,f
+        btfss   STATUS,Z
+        goto    uartStopCheck
+        ; uartState==0, wait for start bit
+        movlw   BIT025_PRELOAD      ; if input is still high, check again in 1/4 baud
+        btfsc   SERIAL_INPUT
+        goto    uartTimerLoad
+        ; serialIn==0, start bit has started
+        clrf    uartData
+        clrf    uartDataReady
+        incf    uartState,f
+        movlw   BIT125_PRELOAD      ; center of first data bit is 1.25 to 1.5 baud from now
+        goto    uartTimerLoad
+
+uartStopCheck:
+        btfss   uartState,4
+        goto    uartBitShift
+        ; uartState==16, wait for stop bit to appear
+        btfsc   SERIAL_INPUT
+        clrf    uartState       ; stop bit HIGH detected, now safe to wait for start bit LOW
+        movlw   BIT025_PRELOAD  ; check for stop or start bit again in 1/4 baud
+        goto    uartTimerLoad
+
+uartBitShift:
+        ; uartState indicates waiting for a data bit
+        ; shift in the data from the input pin
+        bcf     STATUS,C
+        btfsc   SERIAL_INPUT
+        bsf     STATUS,C
+        rrf     uartData,f
+        movlw   BIT_PRELOAD     ; Next bit (or stop bit) is one baud away
+        ; check if we have 8 bits yet
+        btfsc   uartState,3
+        goto    uartByteDone
+        incf    uartState,f
+        goto    uartTimerLoad
+        
+uartByteDone:
+        bsf     uartDataReady,0 ; Indicate uart data is ready to be processed
+        movlw   0x10
+        movwf   uartState       ; Next wait for the line to go idle again
+        movlw   BIT025_PRELOAD  ; check frequently for the start of the stop bit
+        
+uartTimerLoad:
+        addwf   TMR0,F          ; Add value to TMR0 counter, so it doesn't matter how late we are
+        btfsc   STATUS,C        ; If we waited too long to load the timer, this will cause an overflow,
+        bsf     INTCON,T0IF     ;   so we flag that another loop should execute immediately
+;     ------------------------
+
+
+isrDone:
         movf    status_temp,w     ; retrieve copy of STATUS register
         movwf   STATUS            ; restore pre-isr STATUS register contents
         swapf   w_temp,f
@@ -214,8 +321,7 @@ main:
         clrf    GPIO
     
     ; PCLATH: By default, all computed gotos are in page 3
-        movlw   0x03
-        movwf   PCLATH
+        clrf    PCLATH
 
     ; CMCON
     ; Comparator in single-pin mode
@@ -227,8 +333,8 @@ main:
         movlw   0x01
         movwf   T1CON
     
-    ; Enable peripheral interrupts, GIE off until a note is set
-        movlw   0x40
+    ; Enable TMR0 and peripheral interrupts, PEIE off until a note is set
+        movlw   0xA0
         movwf   INTCON
 ;-----------------------------------
 ;}
@@ -261,14 +367,12 @@ main:
         
         clrf    toneCmdReady
         
-        movlw   d'69'           ; Power-on note set to A440
-        movwf   noteNumber
-        bsf     toneCmdReady,0
+        ;movlw   d'69'           ; Power-on note set to A440
+        ;movwf   noteNumber
+        ;bsf     toneCmdReady,0
 
 #ifdef TEST_NOTE_STACK
 ; TEMP TODO
-        movlw   0x33
-        movwf   noteNumber
         movlw   0x43
         movwf   noteStack1
         movlw   0x45
@@ -283,16 +387,24 @@ main:
         movwf   noteStack6
         movlw   0x3B
         movwf   noteStack7
-; Set up a midi note off command
-        movlw   0x90            ; NOTE ON
-        movwf   midiStatus
-        movlw   0x4A
-        movwf   midiNoteBuf
-        movlw   0x00
-        movwf   midiVelocityBuf
-        bsf     midiCmdReady,0  ; Process command next cycle
-#endif
 
+
+        movlw   d'12'
+        movwf   noteNumber
+; Set up a midi note off command
+;        movlw   0x90            ; NOTE ON
+;        movwf   midiStatus
+ ;       movlw   0x77
+  ;      movwf   midiNoteBuf
+   ;     movlw   0x40            ; make it OFF
+    ;    movwf   midiVelocityBuf
+        ;bsf     midiCmdReady,0  ; Process command next cycle
+
+        movlw   0x7f
+        movwf   noteBendValue
+        bsf     toneCmdReady,0
+#endif
+        
 ;-----------------------------------
 ;}
 
@@ -303,64 +415,6 @@ mainloop:
         ;xorwf   GPIO,f
         ;goto    $-2
 
-;     ------------------------
-;         Poll Serial Input
-
-        btfss   INTCON,T0IF
-        goto    uartSkip
-        bcf     INTCON,T0IF
-;{
-        ; Check uartState
-        movf    uartState,f
-        btfss   STATUS,Z
-        goto    uartStopCheck
-        ; uartState==0, wait for start bit
-        movlw   BIT025_PRELOAD      ; if input is still high, check again in 1/4 baud
-        btfsc   SERIAL_INPUT
-        goto    uartTimerLoad
-        ; serialIn==0, start bit has started
-        clrf    uartData
-        clrf    uartDataReady
-        incf    uartState,f
-        movlw   BIT125_PRELOAD      ; center of first data bit is 1.25 to 1.5 baud from now
-        goto    uartTimerLoad
-
-uartStopCheck:
-        btfss   uartState,4
-        goto    uartBitShift
-        ; uartState==16, wait for stop bit to appear
-        btfsc   SERIAL_INPUT
-        clrf    uartState       ; stop bit HIGH detected, now safe to wait for start bit LOW
-        movlw   BIT025_PRELOAD  ; check for stop or start bit again in 1/4 baud
-        goto    uartTimerLoad
-
-uartBitShift:
-        ; uartState indicates waiting for a data bit
-        ; shift in the data from the input pin
-        bcf     STATUS,C
-        btfsc   SERIAL_INPUT
-        bsf     STATUS,C
-        rrf     uartData,f
-        movlw   BIT_PRELOAD     ; Next bit (or stop bit) is one baud away
-        ; check if we have 8 bits yet
-        btfsc   uartState,3
-        goto    uartByteDone
-        incf    uartState,f
-        goto    uartTimerLoad
-        
-uartByteDone:
-        bsf     uartDataReady,0 ; Indicate uart data is ready to be processed
-        movlw   0x10
-        movwf   uartState       ; Next wait for the line to go idle again
-        movlw   BIT025_PRELOAD  ; check frequently for the start of the stop bit
-        
-uartTimerLoad:
-        addwf   TMR0,F          ; Add value to TMR0 counter, so it doesn't matter how late we are
-        btfsc   STATUS,C        ; If we waited too long to load the timer, this will cause an overflow,
-        bsf     INTCON,T0IF     ;   so we flag that another loop should execute immediately
-;}
-uartSkip:
-;     ------------------------
 
 ;     ------------------------
 ; FSM Dispatcher
@@ -444,7 +498,9 @@ midiPitchHighByte:
         movwf   noteBendValue   ; store the bend command
         clrf    midiState    ; next byte is another bend command (rolling status)
         bsf     midiState,2
-        bsf     toneCmdReady,0  ; update the tone immediately based on current noteNumber and new noteBendValue
+        incf    noteNumber,w    ; check if current note is -1, note off
+        btfss   STATUS,Z
+        bsf     toneCmdReady,0  ; note is on, update the tone immediately based on current noteNumber and new noteBendValue
         goto    mainloop
 
 ;     ------------------------
@@ -617,9 +673,10 @@ toneOffPitchStop:
         bcf     TRIGGER_OUTPUT
         ; Leave the frequency output unchanged during the decay period
         ;;;; TEMP: Disable the tone output immediately instead of letting it decay
-        bcf     INTCON,GIE
+        bcf     INTCON,PEIE
         nop
         bcf     TONE_OUTPUT     ; Disable the tone output pin so the speaker stays non-energized
+        bcf     toneCmdReady,0  ; noteNumber is -1, not a valid note to update with
         goto    mainloop
 ;}
 ;     ------------------------
@@ -649,12 +706,7 @@ toneUpdateStart:       ; Set the frequency output based on noteNumber
         
         ; noteNumber < 12, Prescaler is 3
         ; Retrieve table value. WREG already contains noteNumber-12, which is negative
-        movwf   tableAddress
-        call    ToneTableLSB
-        movwf   tempPreloadL
-        movf    tableAddress,w
-        call    ToneTableMSB
-        movwf   tempPreloadH
+        call    CalculatePitchPeriod
         ; Set Prescaler=3
         movlw   0x03
         movwf   tempPrescaler
@@ -665,12 +717,7 @@ toneUpdateStart:       ; Set the frequency output based on noteNumber
 toneOnPS2:
         ; noteNumber >= 12, < 24, Prescaler is 2
         ; Retrieve table value. WREG already contains noteNumber-12, which is positive
-        movwf   tableAddress
-        call    ToneTableLSB
-        movwf   tempPreloadL
-        movf    tableAddress,w
-        call    ToneTableMSB
-        movwf   tempPreloadH
+        call    CalculatePitchPeriod
         ; Set Prescaler=2
         movlw   0x02
         movwf   tempPrescaler
@@ -689,12 +736,7 @@ toneOnPS1or0:
         ; Retrieve table value. WREG already contains noteNumber-36, which is negative
         ; Get entry noteNumber-24
         addlw   TABLE_PS0_START-TABLE_PS1_START     ; add 12 to address before multiplying
-        movwf   tableAddress
-        call    ToneTableLSB
-        movwf   tempPreloadL
-        movf    tableAddress,w
-        call    ToneTableMSB
-        movwf   tempPreloadH
+        call    CalculatePitchPeriod
         ; Set Prescaler=1
         movlw   0x01
         movwf   tempPrescaler
@@ -706,12 +748,7 @@ toneOnPS0:
         ; noteNumber >= 36, < 48, Prescaler is 0 with no delay
         ; Retrieve table value. WREG already contains noteNumber-36, which is positive
         ; Get entry noteNumber-36
-        movwf   tableAddress
-        call    ToneTableLSB
-        movwf   tempPreloadL
-        movf    tableAddress,w
-        call    ToneTableMSB
-        movwf   tempPreloadH
+        call    CalculatePitchPeriod
         ; Set Prescaler=0
         ; Preload = Table + ISR_PS0_OVERHEAD
         goto    toneOnWriteValuePS0
@@ -719,19 +756,18 @@ toneOnPS0:
 toneOnPSM1:
         ; Retrieve table value. WREG already contains noteNumber-48, which is positive
         ; Get entry noteNumber-48
-        movwf   tableAddress
-        call    ToneTableLSB
-        movwf   tempPreloadL
-        movf    tableAddress,w
-        call    ToneTableMSB
-        movwf   tempPreloadH
+        call    CalculatePitchPeriod
         ; Divide table value by 2 to get the half-cycle time
         bsf     STATUS,C            ; Table value is negative, extend sign
         rrf     tempPreloadH,f
         rrf     tempPreloadL,f
-        rlf     tempDelay,f         ; If table value was odd, then we delay one of the half-cycles by one clock
-        btfsc   tempDelay,0
-        incf    tempPreloadL,f        ; If we shifted out a 1, round up toward zero
+        btfss   STATUS,C            ; if we shift out a 1, set the delay bit and round preload up
+        goto    toneOnWriteValuePS0
+        movlw   TONE_OUTPUT_MASK
+        movwf   tempDelay
+        incf    tempPreloadL,f
+        btfsc   STATUS,Z
+        incf    tempPreloadH,f
 toneOnWriteValuePS0:
         ; Set Prescaler=0
         clrf    tempPrescaler       ; By definition, prescaler is 0 when divide by 2
@@ -753,6 +789,7 @@ toneOnWriteValue:
         movwf   tonePrescaler
         movf    tempDelay,w
         movwf   toneDelay
+        bsf     INTCON,PEIE
         bsf     INTCON,GIE
         ; Enable the trigger output
         bsf     TRIGGER_OUTPUT
@@ -761,11 +798,177 @@ toneOnWriteValue:
 ;-----------------------------------
 
 
-; LOOKUP TABLES IN FINAL PAGE
-    ORG     0x0300
+
+
+CalculatePitchPeriod:
+    ; WREG contains the preload table index
+    ; Retrieve the note table
+    ; Then apply pitch bend
+        movwf   tableAddress
+        call    ToneTableLSB
+        movwf   tempPreloadL
+        movf    tableAddress,w
+        call    ToneTableMSB
+        movwf   tempPreloadH
+
+        movlw   0x40
+        xorwf   noteBendValue,w
+        btfsc   STATUS,Z
+        return                  ; If Bend value is 64, no modification is needed
+
+        movf    noteBendValue,w
+        call    PitchBendTable
+        movwf   bendTableValue
+
+        ; Clear M variable, the modifier accumulator
+        clrf    bendAmountL
+        clrf    bendAmountH
+        ; Copy N>>1 into temporary shift register, so we know it's negative
+        ; We'll be discarding lower bits during the multiplication, 
+        ;   so only using 16 bits for shift and accumulate
+        bsf     STATUS,C        ; set the correct sign bit and divide by 2
+        rrf     tempPreloadH,w
+        movwf   bendTempH
+        rrf     tempPreloadL,w
+        movwf   bendTempL
+        btfsc   tempPreloadL,0        ; round bendTempH:bendTempL up if tempPreloadL ended in 11 before shifting
+        btfss   tempPreloadL,1
+        goto    SL_NOROUND
+        incf    bendTempL,f
+        btfsc   STATUS,Z
+        incf    bendTempH,f
+SL_NOROUND:             ;; 11 or 13 inst setup
+        
+        ; Calculate M
+        ; Bit 6 * N
+        negmac16r  bendTableValue,6,bendTempL,bendTempH,bendAmountL,bendAmountH
+        negmac16r  bendTableValue,5,bendTempL,bendTempH,bendAmountL,bendAmountH    
+        negmac16r  bendTableValue,4,bendTempL,bendTempH,bendAmountL,bendAmountH 
+        negmac16r  bendTableValue,3,bendTempL,bendTempH,bendAmountL,bendAmountH    ;; 44 inst first half multiply
+        negmac16r  bendTableValue,2,bendTempL,bendTempH,bendAmountL,bendAmountH
+        negmac16r  bendTableValue,1,bendTempL,bendTempH,bendAmountL,bendAmountH
+        negmac16   bendTableValue,0,bendTempL,bendTempH,bendAmountL,bendAmountH    ;; 30 inst second half multiply
+        
+        ; M = M>>3, arithmetic right shift with round
+        btfss   bendAmountL,2
+        goto    NOROUND     ; no round if bit 3 (last shifted out) is 0
+        movf    bendAmountL,w
+        andlw   0x0F
+        xorlw   0x04
+        btfsc   STATUS,Z
+        goto    NOROUND     ; no round if 4 LSBs are 0100 (including the first one kept)
+        movlw   0x08        ; yes round, add 8 before discarding bits to the right.
+        addwf   bendAmountL,f
+        btfsc   STATUS,C
+        incf    bendAmountH,f
+NOROUND:            ;; 3, 7, or 11 inst rounding
+        asr16 bendAmountL,bendAmountH
+        asr16 bendAmountL,bendAmountH
+        asr16 bendAmountL,bendAmountH        ;; 9 inst right shift
+        
+        ; N = signum(G)?N-(M>>3):N+(M>>3)
+        btfss   bendTableValue,7
+        goto    ADDN
+SUBN:
+        sub16 bendAmountL,bendAmountH,tempPreloadL,tempPreloadH
+        return
+ADDN:
+        add16 bendAmountL,bendAmountH,tempPreloadL,tempPreloadH
+        return
+
+
+    ORG     0x0200
+
+ToneTableLSB:
+;{
+        ; Argument: Place (noteNumber-48)*2+(msb?1:0) in WREG
+        ; Results:  WREG = 0 - (Note period in clocks)
+        bcf     PCLATH,0
+        bsf     PCLATH,1
+        addwf   PCL,f
+        retlw   0xb1 ; Note  48: 6ab1 =  0 - 38223
+        retlw   0x13 ; Note  49: 7313 =  0 - 36077
+        retlw   0xfc ; Note  50: 7afc =  0 - 34052
+        retlw   0x73 ; Note  51: 8273 =  0 - 32141
+        retlw   0x7f ; Note  52: 897f =  0 - 30337
+        retlw   0x25 ; Note  53: 9025 =  0 - 28635
+        retlw   0x6d ; Note  54: 966d =  0 - 27027
+        retlw   0x59 ; Note  55: 9c59 =  0 - 25511
+        retlw   0xf1 ; Note  56: a1f1 =  0 - 24079
+        retlw   0x39 ; Note  57: a739 =  0 - 22727
+        retlw   0x34 ; Note  58: ac34 =  0 - 21452
+        retlw   0xe8 ; Note  59: b0e8 =  0 - 20248
+        retlw   0x59 ; Note  60: b559 =  0 - 19111
+        retlw   0x89 ; Note  61: b989 =  0 - 18039
+        retlw   0x7e ; Note  62: bd7e =  0 - 17026
+        retlw   0x39 ; Note  63: c139 =  0 - 16071
+        retlw   0xbf ; Note  64: c4bf =  0 - 15169
+        retlw   0x13 ; Note  65: c813 =  0 - 14317
+        retlw   0x36 ; Note  66: cb36 =  0 - 13514
+        retlw   0x2d ; Note  67: ce2d =  0 - 12755
+        retlw   0xf9 ; Note  68: d0f9 =  0 - 12039
+        retlw   0x9c ; Note  69: d39c =  0 - 11364
+        retlw   0x1a ; Note  70: d61a =  0 - 10726
+        retlw   0x74 ; Note  71: d874 =  0 - 10124
+        retlw   0xac ; Note  72: daac =  0 -  9556
+        retlw   0xc5 ; Note  73: dcc5 =  0 -  9019
+        retlw   0xbf ; Note  74: debf =  0 -  8513
+        retlw   0x9d ; Note  75: e09d =  0 -  8035
+        retlw   0x60 ; Note  76: e260 =  0 -  7584
+        retlw   0x09 ; Note  77: e409 =  0 -  7159
+        retlw   0x9b ; Note  78: e59b =  0 -  6757
+        retlw   0x16 ; Note  79: e716 =  0 -  6378
+        retlw   0x7c ; Note  80: e87c =  0 -  6020
+        retlw   0xce ; Note  81: e9ce =  0 -  5682
+        retlw   0x0d ; Note  82: eb0d =  0 -  5363
+        retlw   0x3a ; Note  83: ec3a =  0 -  5062
+        retlw   0x56 ; Note  84: ed56 =  0 -  4778
+        retlw   0x62 ; Note  85: ee62 =  0 -  4510
+        retlw   0x5f ; Note  86: ef5f =  0 -  4257
+        retlw   0x4e ; Note  87: f04e =  0 -  4018
+        retlw   0x30 ; Note  88: f130 =  0 -  3792
+        retlw   0x05 ; Note  89: f205 =  0 -  3579
+        retlw   0xce ; Note  90: f2ce =  0 -  3378
+        retlw   0x8b ; Note  91: f38b =  0 -  3189
+        retlw   0x3e ; Note  92: f43e =  0 -  3010
+        retlw   0xe7 ; Note  93: f4e7 =  0 -  2841
+        retlw   0x87 ; Note  94: f587 =  0 -  2681
+        retlw   0x1d ; Note  95: f61d =  0 -  2531
+        retlw   0xab ; Note  96: f6ab =  0 -  2389
+        retlw   0x31 ; Note  97: f731 =  0 -  2255
+        retlw   0xb0 ; Note  98: f7b0 =  0 -  2128
+        retlw   0x27 ; Note  99: f827 =  0 -  2009
+        retlw   0x98 ; Note 100: f898 =  0 -  1896
+        retlw   0x02 ; Note 101: f902 =  0 -  1790
+        retlw   0x67 ; Note 102: f967 =  0 -  1689
+        retlw   0xc6 ; Note 103: f9c6 =  0 -  1594
+        retlw   0x1f ; Note 104: fa1f =  0 -  1505
+        retlw   0x74 ; Note 105: fa74 =  0 -  1420
+        retlw   0xc3 ; Note 106: fac3 =  0 -  1341
+        retlw   0x0f ; Note 107: fb0f =  0 -  1265
+        retlw   0x56 ; Note 108: fb56 =  0 -  1194
+        retlw   0x99 ; Note 109: fb99 =  0 -  1127
+        retlw   0xd8 ; Note 110: fbd8 =  0 -  1064
+        retlw   0x14 ; Note 111: fc14 =  0 -  1004
+        retlw   0x4c ; Note 112: fc4c =  0 -   948
+        retlw   0x81 ; Note 113: fc81 =  0 -   895
+        retlw   0xb3 ; Note 114: fcb3 =  0 -   845
+        retlw   0xe3 ; Note 115: fce3 =  0 -   797
+        retlw   0x10 ; Note 116: fd10 =  0 -   752
+        retlw   0x3a ; Note 117: fd3a =  0 -   710
+        retlw   0x62 ; Note 118: fd62 =  0 -   670
+        retlw   0x87 ; Note 119: fd87 =  0 -   633
+        retlw   0xab ; Note 120: fdab =  0 -   597
+        retlw   0xcc ; Note 121: fdcc =  0 -   564
+        retlw   0xec ; Note 122: fdec =  0 -   532
+        retlw   0x0a ; Note 123: fe0a =  0 -   502
+        retlw   0x26 ; Note 124: fe26 =  0 -   474
+        retlw   0x41 ; Note 125: fe41 =  0 -   447
+        retlw   0x5a ; Note 126: fe5a =  0 -   422
+        retlw   0x71 ; Note 127: fe71 =  0 -   399
+
 ;-----------------------------------
 ToneTableMSB:
-;{
         ; Argument: Place (noteNumber-48)*2+(msb?1:0) in WREG
         ; Results:  WREG = 0 - (Note period in clocks)
         ;movlw  0x03
@@ -851,96 +1054,152 @@ ToneTableMSB:
         retlw   0xfe ; Note 125: fe41 =  0 -   447
         retlw   0xfe ; Note 126: fe5a =  0 -   422
         retlw   0xfe ; Note 127: fe71 =  0 -   399
-
-ToneTableLSB:
-        ; Argument: Place (noteNumber-48)*2+(msb?1:0) in WREG
-        ; Results:  WREG = 0 - (Note period in clocks)
-        ;movlw  0x03
-        ;movwf  PCLATH
-        addwf   PCL,f
-        retlw   0xb1 ; Note  48: 6ab1 =  0 - 38223
-        retlw   0x13 ; Note  49: 7313 =  0 - 36077
-        retlw   0xfc ; Note  50: 7afc =  0 - 34052
-        retlw   0x73 ; Note  51: 8273 =  0 - 32141
-        retlw   0x7f ; Note  52: 897f =  0 - 30337
-        retlw   0x25 ; Note  53: 9025 =  0 - 28635
-        retlw   0x6d ; Note  54: 966d =  0 - 27027
-        retlw   0x59 ; Note  55: 9c59 =  0 - 25511
-        retlw   0xf1 ; Note  56: a1f1 =  0 - 24079
-        retlw   0x39 ; Note  57: a739 =  0 - 22727
-        retlw   0x34 ; Note  58: ac34 =  0 - 21452
-        retlw   0xe8 ; Note  59: b0e8 =  0 - 20248
-        retlw   0x59 ; Note  60: b559 =  0 - 19111
-        retlw   0x89 ; Note  61: b989 =  0 - 18039
-        retlw   0x7e ; Note  62: bd7e =  0 - 17026
-        retlw   0x39 ; Note  63: c139 =  0 - 16071
-        retlw   0xbf ; Note  64: c4bf =  0 - 15169
-        retlw   0x13 ; Note  65: c813 =  0 - 14317
-        retlw   0x36 ; Note  66: cb36 =  0 - 13514
-        retlw   0x2d ; Note  67: ce2d =  0 - 12755
-        retlw   0xf9 ; Note  68: d0f9 =  0 - 12039
-        retlw   0x9c ; Note  69: d39c =  0 - 11364
-        retlw   0x1a ; Note  70: d61a =  0 - 10726
-        retlw   0x74 ; Note  71: d874 =  0 - 10124
-        retlw   0xac ; Note  72: daac =  0 -  9556
-        retlw   0xc5 ; Note  73: dcc5 =  0 -  9019
-        retlw   0xbf ; Note  74: debf =  0 -  8513
-        retlw   0x9d ; Note  75: e09d =  0 -  8035
-        retlw   0x60 ; Note  76: e260 =  0 -  7584
-        retlw   0x09 ; Note  77: e409 =  0 -  7159
-        retlw   0x9b ; Note  78: e59b =  0 -  6757
-        retlw   0x16 ; Note  79: e716 =  0 -  6378
-        retlw   0x7c ; Note  80: e87c =  0 -  6020
-        retlw   0xce ; Note  81: e9ce =  0 -  5682
-        retlw   0x0d ; Note  82: eb0d =  0 -  5363
-        retlw   0x3a ; Note  83: ec3a =  0 -  5062
-        retlw   0x56 ; Note  84: ed56 =  0 -  4778
-        retlw   0x62 ; Note  85: ee62 =  0 -  4510
-        retlw   0x5f ; Note  86: ef5f =  0 -  4257
-        retlw   0x4e ; Note  87: f04e =  0 -  4018
-        retlw   0x30 ; Note  88: f130 =  0 -  3792
-        retlw   0x05 ; Note  89: f205 =  0 -  3579
-        retlw   0xce ; Note  90: f2ce =  0 -  3378
-        retlw   0x8b ; Note  91: f38b =  0 -  3189
-        retlw   0x3e ; Note  92: f43e =  0 -  3010
-        retlw   0xe7 ; Note  93: f4e7 =  0 -  2841
-        retlw   0x87 ; Note  94: f587 =  0 -  2681
-        retlw   0x1d ; Note  95: f61d =  0 -  2531
-        retlw   0xab ; Note  96: f6ab =  0 -  2389
-        retlw   0x31 ; Note  97: f731 =  0 -  2255
-        retlw   0xb0 ; Note  98: f7b0 =  0 -  2128
-        retlw   0x27 ; Note  99: f827 =  0 -  2009
-        retlw   0x98 ; Note 100: f898 =  0 -  1896
-        retlw   0x02 ; Note 101: f902 =  0 -  1790
-        retlw   0x67 ; Note 102: f967 =  0 -  1689
-        retlw   0xc6 ; Note 103: f9c6 =  0 -  1594
-        retlw   0x1f ; Note 104: fa1f =  0 -  1505
-        retlw   0x74 ; Note 105: fa74 =  0 -  1420
-        retlw   0xc3 ; Note 106: fac3 =  0 -  1341
-        retlw   0x0f ; Note 107: fb0f =  0 -  1265
-        retlw   0x56 ; Note 108: fb56 =  0 -  1194
-        retlw   0x99 ; Note 109: fb99 =  0 -  1127
-        retlw   0xd8 ; Note 110: fbd8 =  0 -  1064
-        retlw   0x14 ; Note 111: fc14 =  0 -  1004
-        retlw   0x4c ; Note 112: fc4c =  0 -   948
-        retlw   0x81 ; Note 113: fc81 =  0 -   895
-        retlw   0xb3 ; Note 114: fcb3 =  0 -   845
-        retlw   0xe3 ; Note 115: fce3 =  0 -   797
-        retlw   0x10 ; Note 116: fd10 =  0 -   752
-        retlw   0x3a ; Note 117: fd3a =  0 -   710
-        retlw   0x62 ; Note 118: fd62 =  0 -   670
-        retlw   0x87 ; Note 119: fd87 =  0 -   633
-        retlw   0xab ; Note 120: fdab =  0 -   597
-        retlw   0xcc ; Note 121: fdcc =  0 -   564
-        retlw   0xec ; Note 122: fdec =  0 -   532
-        retlw   0x0a ; Note 123: fe0a =  0 -   502
-        retlw   0x26 ; Note 124: fe26 =  0 -   474
-        retlw   0x41 ; Note 125: fe41 =  0 -   447
-        retlw   0x5a ; Note 126: fe5a =  0 -   422
-        retlw   0x71 ; Note 127: fe71 =  0 -   399
 ;}
 ;-----------------------------------
 
+    ORG     0x0300
+
+PitchBendTable:
+;{
+        ; Argument: WREG = pitch bend command number (0-127)
+        ; Results:  pitch bend fractional multiplier in SIGN+MAGNITUDE format
+        bsf     PCLATH,1
+        bsf     PCLATH,0
+        addwf   PCL,f
+        retlw   0x7D
+        retlw   0x7B
+        retlw   0x79
+        retlw   0x77
+        retlw   0x75
+        retlw   0x73
+        retlw   0x71
+        retlw   0x6F
+        retlw   0x6D
+        retlw   0x6B
+        retlw   0x69
+        retlw   0x67
+        retlw   0x65
+        retlw   0x63
+        retlw   0x61
+        retlw   0x5F
+        retlw   0x5D
+        retlw   0x5B
+        retlw   0x59
+        retlw   0x57
+        retlw   0x55
+        retlw   0x53
+        retlw   0x51
+        retlw   0x4F
+        retlw   0x4D
+        retlw   0x4B
+        retlw   0x49
+        retlw   0x47
+        retlw   0x45
+        retlw   0x43
+        retlw   0x41
+        retlw   0x3F
+        retlw   0x3D
+        retlw   0x3B
+        retlw   0x39
+        retlw   0x37
+        retlw   0x35
+        retlw   0x33
+        retlw   0x31
+        retlw   0x2F
+        retlw   0x2D
+        retlw   0x2B
+        retlw   0x29
+        retlw   0x28
+        retlw   0x26
+        retlw   0x24
+        retlw   0x22
+        retlw   0x20
+        retlw   0x1E
+        retlw   0x1C
+        retlw   0x1A
+        retlw   0x18
+        retlw   0x16
+        retlw   0x15
+        retlw   0x13
+        retlw   0x11
+        retlw   0xF
+        retlw   0xD
+        retlw   0xB
+        retlw   0x9
+        retlw   0x7
+        retlw   0x6
+        retlw   0x4
+        retlw   0x2
+        retlw   0x0
+        retlw   0x82
+        retlw   0x84
+        retlw   0x86
+        retlw   0x87
+        retlw   0x89
+        retlw   0x8B
+        retlw   0x8D
+        retlw   0x8F
+        retlw   0x91
+        retlw   0x93
+        retlw   0x94
+        retlw   0x96
+        retlw   0x98
+        retlw   0x9A
+        retlw   0x9C
+        retlw   0x9E
+        retlw   0x9F
+        retlw   0xA1
+        retlw   0xA3
+        retlw   0xA5
+        retlw   0xA7
+        retlw   0xA8
+        retlw   0xAA
+        retlw   0xAC
+        retlw   0xAE
+        retlw   0xB0
+        retlw   0xB1
+        retlw   0xB3
+        retlw   0xB5
+        retlw   0xB7
+        retlw   0xB9
+        retlw   0xBA
+        retlw   0xBC
+        retlw   0xBE
+        retlw   0xC0
+        retlw   0xC1
+        retlw   0xC3
+        retlw   0xC5
+        retlw   0xC7
+        retlw   0xC8
+        retlw   0xCA
+        retlw   0xCC
+        retlw   0xCE
+        retlw   0xCF
+        retlw   0xD1
+        retlw   0xD3
+        retlw   0xD5
+        retlw   0xD6
+        retlw   0xD8
+        retlw   0xDA
+        retlw   0xDB
+        retlw   0xDD
+        retlw   0xDF
+        retlw   0xE1
+        retlw   0xE2
+        retlw   0xE4
+        retlw   0xE6
+        retlw   0xE7
+        retlw   0xE9
+        retlw   0xEB
+        retlw   0xEC
+        retlw   0xEE
+        retlw   0xF0
+
+
+
+
+;}
+;-----------------------------------
 
 
 
