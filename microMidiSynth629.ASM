@@ -282,6 +282,10 @@ main:
     ; Select BANK0 for the remainder of the program
         bcf     STATUS,RP0
 
+    ; TMR0
+    ; Reset it so we wait a while before the first UART polling
+        clrf    TMR0
+
     ; GPIO
     ; Turn off I/O pins
         clrf    GPIO
@@ -355,7 +359,7 @@ main:
         movlw   0x3B
         movwf   noteStack7
 
-        movlw   d'50'
+        movlw   d'10'
         movwf   noteNumber
 ; Set up a midi note off command
 ;        movlw   0x90            ; NOTE ON
@@ -366,7 +370,7 @@ main:
     ;    movwf   midiVelocityBuf
         ;bsf     midiCmdReady,0  ; Process command next cycle
 
-        movlw   0x0
+        movlw   0x40
         movwf   noteBendValue
         bsf     toneCmdReady,0
 #endif
@@ -671,6 +675,7 @@ toneUpdateStart:       ; Set the frequency output based on noteNumber
         
         ; noteNumber < 12, Prescaler is 3
         ; Retrieve table value. WREG already contains noteNumber-12, which is negative
+        movf    noteNumber,w
         call    CalculatePitchPeriod
         ; Set Prescaler=3
         movlw   0x03
