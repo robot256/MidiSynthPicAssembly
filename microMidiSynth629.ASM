@@ -124,9 +124,9 @@ bendTableValue  EQU 0x42
         ORG     0x000             ; processor reset vector
         goto    main              ; go to beginning of program
 
-        ; Version number: 1.0
-        retlw   0x01
-        retlw   0x00
+        ; Version number: 2.3
+        retlw   0x02
+        retlw   0x03
 
 ;-----------------------------------
 ; INTERRUPT SERVICE ROUTINE
