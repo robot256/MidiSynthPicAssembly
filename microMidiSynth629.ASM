@@ -119,46 +119,6 @@ bendTableValue  EQU 0x42
 
 ;#define TEST_NOTE_STACK
 
-;***** MACRO DEFINITIONS
-
-
-; u2:u1 = u2:u1 - a2:a1
-sub16 MACRO a1,a2,u1,u2
-        movf    a1,w
-        subwf   u1,f
-        movf    a2,w
-        btfss   STATUS,C
-        incfsz  a2,w
-        subwf   u2,f 
-    ENDM
-
-; u2:u1 = u2:u1 + a2:a1
-add16 MACRO a1,a2,u1,u2
-        movf    a1,w
-        addwf   u1,f
-        movf    a2,w
-        btfsc   STATUS,C
-        incfsz  a2,w
-        addwf   u2,f
-    ENDM
-
-asr16 MACRO u1,u2
-        rlf     u2,w
-        rrf     u2,f
-        rrf     u1,f
-    ENDM
-
-negmac16 MACRO a,ab,b1,b2,u1,u2
-        btfss   a,ab
-        goto    $+7
-        add16   b1,b2,u1,u2
-    ENDM
-
-negmac16r MACRO a,ab,b1,b2,u1,u2
-        negmac16 a,ab,b1,b2,u1,u2
-        asr16 b1,b2
-    ENDM
-
 
 ;**********************************************************************
         ORG     0x000             ; processor reset vector
@@ -176,9 +136,76 @@ negmac16r MACRO a,ab,b1,b2,u1,u2
         movf    STATUS,w          ; move status register into W register
         movwf   status_temp       ; save off contents of STATUS register
 
+isrCheckUart:
+        btfss   INTCON,T0IF
+        goto    isrCheckTone
+        bcf     INTCON,T0IF
+
+; Poll Serial Input
+        ; Check uartState
+        movf    uartState,f
+        btfss   STATUS,Z
+        goto    uartStopCheck
+        ; uartState==0, looking for start bit
+        btfss   SERIAL_INPUT
+        goto    uartStartFound
+             ; serialIn==1, check in 0.25 baud
+uartLoadQuarter:
+        movlw   BIT025_PRELOAD      ; if input is still high, check again in 1/4 baud
+uartLoadTimer:
+        addwf   TMR0,F          ; Add value to TMR0 counter, so it doesn't matter how late we are
+        movf    status_temp,w     ; retrieve copy of STATUS register
+        movwf   STATUS            ; restore pre-isr STATUS register contents
+        swapf   w_temp,f
+        swapf   w_temp,w          ; restore pre-isr W register contents
+        retfie                    ; return from interrupt
+        
+uartStartFound:
+        ; serialIn==0, start bit has started
+        clrf    uartData
+        clrf    uartDataReady
+        incf    uartState,f
+            ; center of first data bit is 1.25 to 1.5 baud from now
+;uartLoadThreeHalves:
+        movlw   BIT125_PRELOAD      ; if input is still high, check again in 1/4 baud
+        goto    uartLoadTimer
+
+uartStopCheck:
+        btfss   uartState,4
+        goto    uartBitShift
+        ; uartState==16, wait for stop bit to appear
+        btfsc   SERIAL_INPUT
+        clrf    uartState       ; stop bit HIGH detected, now safe to wait for start bit LOW
+        goto    uartLoadQuarter ; check for stop or start bit again in 1/4 baud
+
+uartBitShift:
+        ; uartState indicates waiting for a data bit
+        ; shift in the data from the input pin
+        bcf     STATUS,C
+        btfsc   SERIAL_INPUT
+        bsf     STATUS,C
+        rrf     uartData,f
+        ; check if we have 8 bits yet
+        btfsc   uartState,3
+        goto    uartByteDone
+        incf    uartState,f
+           ; Next bit (or stop bit) is one baud away
+;uartLoadFull:
+        movlw   BIT_PRELOAD      ; if input is still high, check again in 1/4 baud
+        goto    uartLoadTimer
+        
+uartByteDone:
+        bsf     uartDataReady,0 ; Indicate uart data is ready to be processed
+        movlw   0x10
+        movwf   uartState       ; Next wait for the line to go idle again
+                                  ; check frequently for the start of the stop bit
+        goto    uartLoadQuarter
+
+
+isrCheckTone:
         btfsc   INTCON,PEIE
         btfss   PIR1,TMR1IF
-        goto    isrCheckUart
+        goto    isrDone
 
         bcf     PIR1,TMR1IF
         
@@ -207,68 +234,7 @@ shortDelay:
         movwf   TMR1H
         ; Reenable TMR1
         bsf     T1CON,TMR1ON
-
-isrCheckUart:
-        btfss   INTCON,T0IF
-        goto    isrDone
-; Run the UART code
-
-;     ------------------------
-;         Poll Serial Input
-
-        bcf     INTCON,T0IF
-
-        ; Check uartState
-        movf    uartState,f
-        btfss   STATUS,Z
-        goto    uartStopCheck
-        ; uartState==0, wait for start bit
-        movlw   BIT025_PRELOAD      ; if input is still high, check again in 1/4 baud
-        btfsc   SERIAL_INPUT
-        goto    uartTimerLoad
-        ; serialIn==0, start bit has started
-        clrf    uartData
-        clrf    uartDataReady
-        incf    uartState,f
-        movlw   BIT125_PRELOAD      ; center of first data bit is 1.25 to 1.5 baud from now
-        goto    uartTimerLoad
-
-uartStopCheck:
-        btfss   uartState,4
-        goto    uartBitShift
-        ; uartState==16, wait for stop bit to appear
-        btfsc   SERIAL_INPUT
-        clrf    uartState       ; stop bit HIGH detected, now safe to wait for start bit LOW
-        movlw   BIT025_PRELOAD  ; check for stop or start bit again in 1/4 baud
-        goto    uartTimerLoad
-
-uartBitShift:
-        ; uartState indicates waiting for a data bit
-        ; shift in the data from the input pin
-        bcf     STATUS,C
-        btfsc   SERIAL_INPUT
-        bsf     STATUS,C
-        rrf     uartData,f
-        movlw   BIT_PRELOAD     ; Next bit (or stop bit) is one baud away
-        ; check if we have 8 bits yet
-        btfsc   uartState,3
-        goto    uartByteDone
-        incf    uartState,f
-        goto    uartTimerLoad
         
-uartByteDone:
-        bsf     uartDataReady,0 ; Indicate uart data is ready to be processed
-        movlw   0x10
-        movwf   uartState       ; Next wait for the line to go idle again
-        movlw   BIT025_PRELOAD  ; check frequently for the start of the stop bit
-        
-uartTimerLoad:
-        addwf   TMR0,F          ; Add value to TMR0 counter, so it doesn't matter how late we are
-        btfsc   STATUS,C        ; If we waited too long to load the timer, this will cause an overflow,
-        bsf     INTCON,T0IF     ;   so we flag that another loop should execute immediately
-;     ------------------------
-
-
 isrDone:
         movf    status_temp,w     ; retrieve copy of STATUS register
         movwf   STATUS            ; restore pre-isr STATUS register contents
@@ -321,7 +287,8 @@ main:
         clrf    GPIO
     
     ; PCLATH: By default, all computed gotos are in page 3
-        clrf    PCLATH
+        movlw   0x02
+        movwf   PCLATH
 
     ; CMCON
     ; Comparator in single-pin mode
@@ -388,8 +355,7 @@ main:
         movlw   0x3B
         movwf   noteStack7
 
-
-        movlw   d'12'
+        movlw   d'50'
         movwf   noteNumber
 ; Set up a midi note off command
 ;        movlw   0x90            ; NOTE ON
@@ -400,11 +366,10 @@ main:
     ;    movwf   midiVelocityBuf
         ;bsf     midiCmdReady,0  ; Process command next cycle
 
-        movlw   0x7f
+        movlw   0x0
         movwf   noteBendValue
         bsf     toneCmdReady,0
 #endif
-        
 ;-----------------------------------
 ;}
 
@@ -840,16 +805,92 @@ CalculatePitchPeriod:
 SL_NOROUND:             ;; 11 or 13 inst setup
         
         ; Calculate M
-        ; Bit 6 * N
-        negmac16r  bendTableValue,6,bendTempL,bendTempH,bendAmountL,bendAmountH
-        negmac16r  bendTableValue,5,bendTempL,bendTempH,bendAmountL,bendAmountH    
-        negmac16r  bendTableValue,4,bendTempL,bendTempH,bendAmountL,bendAmountH 
-        negmac16r  bendTableValue,3,bendTempL,bendTempH,bendAmountL,bendAmountH    ;; 44 inst first half multiply
-        negmac16r  bendTableValue,2,bendTempL,bendTempH,bendAmountL,bendAmountH
-        negmac16r  bendTableValue,1,bendTempL,bendTempH,bendAmountL,bendAmountH
-        negmac16   bendTableValue,0,bendTempL,bendTempH,bendAmountL,bendAmountH    ;; 30 inst second half multiply
+        ; bendTableValue magnitude is always positive
+        ; bendTemp is always negative (because ToneTable value is always negative)
+        ; bendAmount always negative
+        ; bendAmount is either added to or subtracted from tempPreload based on bendTableValue sign
         
-        ; M = M>>3, arithmetic right shift with round
+        ;negmac16r  bendTableValue,6,bendTempL,bendTempH,bendAmountL,bendAmountH
+        btfss   bendTableValue,6
+        goto    $+5
+        movf    bendTempL,w     ; bendAmount is always 0 at this stage, just overwrite it
+        movwf   bendAmountL
+        movf    bendTempH,w
+        movwf   bendAmountH
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16r  bendTableValue,5,bendTempL,bendTempH,bendAmountL,bendAmountH    
+        btfss   bendTableValue,5
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16r  bendTableValue,4,bendTempL,bendTempH,bendAmountL,bendAmountH 
+        btfss   bendTableValue,4
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16r  bendTableValue,3,bendTempL,bendTempH,bendAmountL,bendAmountH    ;; 44 inst first half multiply
+        btfss   bendTableValue,3
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16r  bendTableValue,2,bendTempL,bendTempH,bendAmountL,bendAmountH
+        btfss   bendTableValue,2
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16r  bendTableValue,1,bendTempL,bendTempH,bendAmountL,bendAmountH
+        btfss   bendTableValue,1
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16   bendTableValue,0,bendTempL,bendTempH,bendAmountL,bendAmountH    ;; 30 inst second half multiply
+        btfss   bendTableValue,0
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        
+        ; M = M>>3, arithmetic right shift with round (preserve or restore negative sign)
         btfss   bendAmountL,2
         goto    NOROUND     ; no round if bit 3 (last shifted out) is 0
         movf    bendAmountL,w
@@ -862,19 +903,42 @@ SL_NOROUND:             ;; 11 or 13 inst setup
         btfsc   STATUS,C
         incf    bendAmountH,f
 NOROUND:            ;; 3, 7, or 11 inst rounding
-        asr16 bendAmountL,bendAmountH
-        asr16 bendAmountL,bendAmountH
-        asr16 bendAmountL,bendAmountH        ;; 9 inst right shift
+        ;asr16 bendAmountL,bendAmountH
+        ;asr16 bendAmountL,bendAmountH
+        ;asr16 bendAmountL,bendAmountH        ;; 9 inst right shift
+        rrf     bendAmountH,f
+        rrf     bendAmountL,f
+        rrf     bendAmountH,f
+        rrf     bendAmountL,f
+        rrf     bendAmountH,f
+        rrf     bendAmountL,f
+        ; Make sure bendAmount stays negative by setting the upper 3 bits
+        movlw   0xE0
+        iorwf   bendAmountH,f
         
         ; N = signum(G)?N-(M>>3):N+(M>>3)
+        movf    bendAmountL,w
         btfss   bendTableValue,7
         goto    ADDN
 SUBN:
-        sub16 bendAmountL,bendAmountH,tempPreloadL,tempPreloadH
+        ;sub16 bendAmountL,bendAmountH,tempPreloadL,tempPreloadH
+        ;movf    bendAmountL,w
+        subwf   tempPreloadL,f
+        movf    bendAmountH,w
+        btfss   STATUS,C
+        incfsz  bendAmountH,w
+        subwf   tempPreloadH,f 
         return
 ADDN:
-        add16 bendAmountL,bendAmountH,tempPreloadL,tempPreloadH
+        ;add16 bendAmountL,bendAmountH,tempPreloadL,tempPreloadH
+        ;movf    bendAmountL,w
+        addwf   tempPreloadL,f
+        movf    bendAmountH,w
+        btfsc   STATUS,C
+        incfsz  bendAmountH,w
+        addwf   tempPreloadH,f
         return
+
 
 
     ORG     0x0200
@@ -883,8 +947,8 @@ ToneTableLSB:
 ;{
         ; Argument: Place (noteNumber-48)*2+(msb?1:0) in WREG
         ; Results:  WREG = 0 - (Note period in clocks)
+        ;bsf     PCLATH,1
         bcf     PCLATH,0
-        bsf     PCLATH,1
         addwf   PCL,f
         retlw   0xb1 ; Note  48: 6ab1 =  0 - 38223
         retlw   0x13 ; Note  49: 7313 =  0 - 36077
@@ -1063,7 +1127,7 @@ PitchBendTable:
 ;{
         ; Argument: WREG = pitch bend command number (0-127)
         ; Results:  pitch bend fractional multiplier in SIGN+MAGNITUDE format
-        bsf     PCLATH,1
+        ;bsf     PCLATH,1
         bsf     PCLATH,0
         addwf   PCL,f
         retlw   0x7D
