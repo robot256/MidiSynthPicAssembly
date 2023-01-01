@@ -59,6 +59,11 @@
 #define MIDI_ON_CMD     0x90
 #define MIDI_OFF_CMD    0x80
 #define MIDI_BEND_CMD   0xE0
+#define MIDI_CONTROL_CMD 0xF0
+
+; Midi Control definitions
+#define CONTROL_MODULATION 0x01
+#define CONTROL_VIBRATO    0x05
 
 ; Tone table parameters
 #define TABLE_PSM1_START  d'48'
@@ -99,7 +104,7 @@ tempPreloadL    EQU 0x31
 tempPreloadH    EQU 0x32
 tableAddress    EQU 0x33
 
-noteBendValue   EQU 0x34
+noteBendValue   EQU 0x34        ; composite bend value (from pitchBendValue
 
 noteNumber      EQU 0x35        ; ID of the note currently playing (255=off)
 noteStack1      EQU 0x36
@@ -110,13 +115,23 @@ noteStack5      EQU 0x3A
 noteStack6      EQU 0x3B
 noteStack7      EQU 0x3C
 
-pitchBendCmdReady EQU   0x3D
+vibratoBendValue EQU 0x3D       ; Instantaneous vibrato pitch bend command contribution (signed)
+
 bendAmountL     EQU 0x3E
 bendAmountH     EQU 0x3F
 bendTempL       EQU 0x40
 bendTempH       EQU 0x41
 bendTableValue  EQU 0x42
 
+pitchBendValue  EQU 0x43        ; MIDI pitch bend wheel value
+vibratoBendMax  EQU 0x44        ; Max value of the vibrato based on the Modulation Control (0-32, modulation>>2)
+controlNumber   EQU 0x45        ; MIDI command stream number of most recent control parameter packet
+vibratoValue    EQU 0x46        ; MIDI vibrato control (#5), vibrato Frequency (not used yet) TODO
+
+vibratoTimerStep EQU 0x47       ; Number of quarter-periods to add next interrupt
+vibratoTimerL    EQU 0x48       ; Counts quarter-periods in the ISR (counts at 125 kHz)
+vibratoTimerH    EQU 0x49       ; Counts 64x quarter-periods in the mainloop (counts at 1953.125 Hz)
+vibratoBendStep  EQU 0x4A       ; Counts to change the vibrato by
 ;#define TEST_NOTE_STACK
 
 
@@ -178,19 +193,24 @@ isrCheckUart:
 
         bcf     INTCON,T0IF
 
+        ; Update the quarter-bit counter
+        incf    vibratoTimerStep,w   ; 0 means just one period
+        addwf   vibratoTimerL,f
+        clrf    vibratoTimerStep
+
         ; Check uartState
         movf    uartState,f
         btfss   STATUS,Z
         goto    uartStopCheck
         ; uartState==0, wait for start bit
-        movlw   BIT025_PRELOAD      ; if input is still high, check again in 1/4 baud
         btfsc   SERIAL_INPUT
-        goto    uartTimerLoad
+        goto    uartTimerLoad025    ; if input is still high, check again in 1/4 baud
         ; serialIn==0, start bit has started
         clrf    uartData
         clrf    uartDataReady
         incf    uartState,f
         movlw   BIT125_PRELOAD      ; center of first data bit is 1.25 to 1.5 baud from now
+        bsf     vibratoTimerStep,2  ; 5 quarter periods, set increment to 4
         goto    uartTimerLoad
 
 uartStopCheck:
@@ -199,9 +219,8 @@ uartStopCheck:
         ; uartState==16, wait for stop bit to appear
         btfsc   SERIAL_INPUT
         clrf    uartState       ; stop bit HIGH detected, now safe to wait for start bit LOW
-        movlw   BIT025_PRELOAD  ; check for stop or start bit again in 1/4 baud
-        goto    uartTimerLoad
-
+        goto    uartTimerLoad025  ; check for stop or start bit again in 1/4 baud
+        
 uartBitShift:
         ; uartState indicates waiting for a data bit
         ; shift in the data from the input pin
@@ -209,17 +228,21 @@ uartBitShift:
         btfsc   SERIAL_INPUT
         bsf     STATUS,C
         rrf     uartData,f
-        movlw   BIT_PRELOAD     ; Next bit (or stop bit) is one baud away
         ; check if we have 8 bits yet
         btfsc   uartState,3
-        goto    uartByteDone
-        incf    uartState,f
+        goto    uartByteDone    ; Last bit reached, stop counting full bit periods
+        incf    uartState,f     ; Increment bit counter
+        movlw   0x03            ; 4 quarter periods, set increment to 3
+        movwf   vibratoTimerStep
+        movlw   BIT_PRELOAD     ; Next bit (or stop bit) is one baud away
         goto    uartTimerLoad
         
 uartByteDone:
         bsf     uartDataReady,0 ; Indicate uart data is ready to be processed
         movlw   0x10
         movwf   uartState       ; Next wait for the line to go idle again
+
+uartTimerLoad025:
         movlw   BIT025_PRELOAD  ; check frequently for the start of the stop bit
         
 uartTimerLoad:
@@ -317,7 +340,18 @@ main:
         clrf    midiCmdReady
 
         movlw   0x40
-        movwf    noteBendValue
+        movwf   noteBendValue
+        movwf   pitchBendValue
+        movwf   vibratoValue
+
+        clrf    vibratoTimerStep
+        clrf    vibratoTimerL
+        clrf    vibratoTimerH
+        clrf    vibratoBendValue
+        clrf    vibratoBendMax
+
+        movlw   0x01
+        movwf   vibratoBendStep
 
         ; Set all the array elements to -1
         movlw   0xFF
@@ -378,7 +412,11 @@ mainloop:
         ;xorwf   GPIO,f
         ;goto    $-2
 
-
+; Update the vibrato timer
+        btfss   vibratoTimerL,6
+        btfsc   vibratoTimerL,7
+        goto    vibratoOverflow
+skipVibrato:
 ;     ------------------------
 ; FSM Dispatcher
         btfsc   uartDataReady,0
@@ -391,6 +429,70 @@ mainloop:
         goto    toneUpdateStart
 
         goto    mainloop
+
+vibratoOverflow:
+        ; ISR counter overflowed, increment next
+        incf    vibratoTimerH,f
+        movlw   0x40
+        subwf   vibratoTimerL,f
+
+        ; Update vibrato's contribution to the pitch bend
+        ; 3 Hz == value of 5
+        movlw   0x0A
+        xorwf   vibratoTimerH,w
+        btfss   STATUS,Z
+        goto    mainloop
+
+        clrf    vibratoTimerH
+
+        movf    vibratoBendMax,f
+        btfsc   STATUS,Z
+        clrf    vibratoBendValue
+        btfsc   STATUS,Z
+        goto    skipVibrato
+
+        ; Update the vibratoBendValue
+        ; vibratoBendValue += vibratoBendStep
+        movf    vibratoBendStep,w
+        addwf   vibratoBendValue,f
+
+        btfsc   vibratoBendStep,7
+        goto    vibratoCheckNegativeMax ; if decrementing, only check the lower bound
+
+vibratoCheckPositiveMax:
+        ; if vibratoBendValue >= vibratoBendMax then  <==>  if vibratoBendMax <= vibratoBendValue then
+        movf    vibratoBendMax,w
+        subwf   vibratoBendValue,w      ; vibratoBendValue - vibratoBendMax
+        btfss   vibratoBendValue,7      ; vibratoBendValue is still negative, don't check against max yet
+        btfss   STATUS,C
+        goto    checkIfToneOnThenMainloop
+
+vibratoReachedPositiveMax:
+        ;    vibratoBendValue = vibratoBendMax
+        movf    vibratoBendMax,w
+        ;    vibratoBendStep = 0 - vibratoBendStep
+        goto    vibratoSwitchDirections
+
+        ; elseif -vibratoBendValue >= vibratoBendMax then  <==> 
+vibratoCheckNegativeMax:
+        movf    vibratoBendValue,w
+        addwf   vibratoBendMax,w        ; vibratoBendValue + vibratoBendMax
+        btfsc   vibratoBendValue,7      ; vibratoBendValue is still positive, don't check against min yet
+        btfss   STATUS,C
+        goto    checkIfToneOnThenMainloop
+
+vibratoReachedNegativeMax:
+        ;    vibratoBendValue = 0 - vibratoBendMax
+        comf    vibratoBendMax,w
+        addlw   0x01
+        ;    vibratoBendStep = 0 - vibratoBendStep
+
+vibratoSwitchDirections:
+        movwf   vibratoBendValue
+        comf    vibratoBendStep,f
+        incf    vibratoBendStep,f
+        goto    checkIfToneOnThenMainloop
+
 
 
 ;     ------------------------
@@ -416,6 +518,15 @@ midiPacketStart:
         movf    uartData,w
         xorlw   (MIDI_BEND_CMD|MIDI_CHANNEL)
         btfsc   STATUS,Z
+        goto    midiBendStatus
+        ; Check for Controller value status
+        movf    uartData,w
+        xorlw   (MIDI_CONTROL_CMD|MIDI_CHANNEL)
+        btfsc   STATUS,Z
+        bsf     midiState,4     ; it is a modulation, read data bytes
+        goto    mainloop
+        
+midiBendStatus:
         bsf     midiState,2     ; it is a pitch bend, read data bytes
         goto    mainloop
         
@@ -427,8 +538,21 @@ midiNoteStatus:
 midiDataByte:
         ; Not a midi status byte
         ; See if we are expecting any data bytes
-        btfss   midiState,0
+        btfsc   midiState,0
+        goto    midiNoteByte
+        btfsc   midiState,1
         goto    midiVelocityByte
+        btfsc   midiState,2
+        goto    midiPitchLowByte
+        btfsc   midiState,3
+        goto    midiPitchHighByte
+        btfsc   midiState,4
+        goto    midiControlNumberByte
+        btfsc   midiState,5
+        goto    midiControlValueByte
+        goto    mainloop
+        
+midiNoteByte:
         ; This is a midi note number byte
         movf    uartData,w
         movwf   midiNoteBuf     ; store the note number in buffer
@@ -436,8 +560,6 @@ midiDataByte:
         goto    mainloop
         
 midiVelocityByte:
-        btfss   midiState,1
-        goto    midiPitchLowByte   ; Check if waiting for bend command instead
         ; This is a midi note velocity byte
         movf    uartData,w
         movwf   midiVelocityBuf ; store the note velocity in buffer
@@ -446,25 +568,57 @@ midiVelocityByte:
         goto    mainloop
         
 midiPitchLowByte:
-        btfss   midiState,2
-        goto    midiPitchHighByte
         ; This is a midi bend command low byte, don't bother saving it
         clrf    midiState
         bsf     midiState,3
         goto    mainloop
 
 midiPitchHighByte:
-        btfss   midiState,3
-        goto    mainloop
         ; This is a midi bend command high byte, store it
         movf    uartData,w
-        movwf   noteBendValue   ; store the bend command
+        movwf   pitchBendValue   ; store the bend command
         clrf    midiState    ; next byte is another bend command (rolling status)
         bsf     midiState,2
+checkIfToneOnThenMainloop:
         incf    noteNumber,w    ; check if current note is -1, note off
         btfss   STATUS,Z
         bsf     toneCmdReady,0  ; note is on, update the tone immediately based on current noteNumber and new noteBendValue
         goto    mainloop
+
+midiControlNumberByte:
+        ; This is a midi control number byte
+        movf    uartData,w
+        movwf   controlNumber
+        clrf    midiState
+        bsf     midiState,5
+        goto    mainloop
+
+midiControlValueByte:
+        ; This is the midi control value byte
+        ; Check if we care about this control number
+        clrf    midiState
+        bsf     midiState,4             ; next byte will be waiting for control number, whether we save this value or not
+        movf    controlNumber,w
+        xorlw   CONTROL_MODULATION
+        btfsc   STATUS,Z
+        goto    midiModulationByte      ; stored control number is Modulation
+        movf    controlNumber,w
+        xorlw   CONTROL_VIBRATO
+        btfsc   STATUS,Z
+        goto    midiVibratoByte         ; stored control number is Vibrato
+        goto    mainloop                ; stored control number is not recognized
+
+midiModulationByte:
+        rrf     uartData,f
+        rrf     uartData,w
+        andlw   0x1F
+        movwf   vibratoBendMax  ; 0-127 -> 0-31 for the vibrato bend maximum
+        goto    checkIfToneOnThenMainloop
+
+midiVibratoByte:
+        movf    uartData,w
+        movwf   vibratoValue
+        goto    checkIfToneOnThenMainloop
 
 ;     ------------------------
 ;}
@@ -764,181 +918,6 @@ toneOnWriteValue:
 
 
 
-CalculatePitchPeriod:
-    ; WREG contains the preload table index
-    ; Retrieve the note table
-    ; Then apply pitch bend
-        movwf   tableAddress
-        call    ToneTableLSB
-        movwf   tempPreloadL
-        movf    tableAddress,w
-        call    ToneTableMSB
-        movwf   tempPreloadH
-
-        movlw   0x40
-        xorwf   noteBendValue,w
-        btfsc   STATUS,Z
-        return                  ; If Bend value is 64, no modification is needed
-
-        movf    noteBendValue,w
-        call    PitchBendTable
-        movwf   bendTableValue
-
-        ; Clear M variable, the modifier accumulator
-        clrf    bendAmountL
-        clrf    bendAmountH
-        ; Copy N>>1 into temporary shift register, so we know it's negative
-        ; We'll be discarding lower bits during the multiplication, 
-        ;   so only using 16 bits for shift and accumulate
-        bsf     STATUS,C        ; set the correct sign bit and divide by 2
-        rrf     tempPreloadH,w
-        movwf   bendTempH
-        rrf     tempPreloadL,w
-        movwf   bendTempL
-        btfsc   tempPreloadL,0        ; round bendTempH:bendTempL up if tempPreloadL ended in 11 before shifting
-        btfss   tempPreloadL,1
-        goto    SL_NOROUND
-        incf    bendTempL,f
-        btfsc   STATUS,Z
-        incf    bendTempH,f
-SL_NOROUND:             ;; 11 or 13 inst setup
-        
-        ; Calculate M
-        ; bendTableValue magnitude is always positive
-        ; bendTemp is always negative (because ToneTable value is always negative)
-        ; bendAmount always negative
-        ; bendAmount is either added to or subtracted from tempPreload based on bendTableValue sign
-        
-        ;negmac16r  bendTableValue,6,bendTempL,bendTempH,bendAmountL,bendAmountH
-        btfss   bendTableValue,6
-        goto    $+5
-        movf    bendTempL,w     ; bendAmount is always 0 at this stage, just overwrite it
-        movwf   bendAmountL
-        movf    bendTempH,w
-        movwf   bendAmountH
-        bsf     STATUS,C
-        rrf     bendTempH,f
-        rrf     bendTempL,f
-        ;negmac16r  bendTableValue,5,bendTempL,bendTempH,bendAmountL,bendAmountH    
-        btfss   bendTableValue,5
-        goto    $+7
-        movf    bendTempL,w
-        addwf   bendAmountL,f
-        movf    bendTempH,w
-        btfsc   STATUS,C
-        incfsz  bendTempH,w
-        addwf   bendAmountH,f
-        bsf     STATUS,C
-        rrf     bendTempH,f
-        rrf     bendTempL,f
-        ;negmac16r  bendTableValue,4,bendTempL,bendTempH,bendAmountL,bendAmountH 
-        btfss   bendTableValue,4
-        goto    $+7
-        movf    bendTempL,w
-        addwf   bendAmountL,f
-        movf    bendTempH,w
-        btfsc   STATUS,C
-        incfsz  bendTempH,w
-        addwf   bendAmountH,f
-        bsf     STATUS,C
-        rrf     bendTempH,f
-        rrf     bendTempL,f
-        ;negmac16r  bendTableValue,3,bendTempL,bendTempH,bendAmountL,bendAmountH    ;; 44 inst first half multiply
-        btfss   bendTableValue,3
-        goto    $+7
-        movf    bendTempL,w
-        addwf   bendAmountL,f
-        movf    bendTempH,w
-        btfsc   STATUS,C
-        incfsz  bendTempH,w
-        addwf   bendAmountH,f
-        bsf     STATUS,C
-        rrf     bendTempH,f
-        rrf     bendTempL,f
-        ;negmac16r  bendTableValue,2,bendTempL,bendTempH,bendAmountL,bendAmountH
-        btfss   bendTableValue,2
-        goto    $+7
-        movf    bendTempL,w
-        addwf   bendAmountL,f
-        movf    bendTempH,w
-        btfsc   STATUS,C
-        incfsz  bendTempH,w
-        addwf   bendAmountH,f
-        bsf     STATUS,C
-        rrf     bendTempH,f
-        rrf     bendTempL,f
-        ;negmac16r  bendTableValue,1,bendTempL,bendTempH,bendAmountL,bendAmountH
-        btfss   bendTableValue,1
-        goto    $+7
-        movf    bendTempL,w
-        addwf   bendAmountL,f
-        movf    bendTempH,w
-        btfsc   STATUS,C
-        incfsz  bendTempH,w
-        addwf   bendAmountH,f
-        bsf     STATUS,C
-        rrf     bendTempH,f
-        rrf     bendTempL,f
-        ;negmac16   bendTableValue,0,bendTempL,bendTempH,bendAmountL,bendAmountH    ;; 30 inst second half multiply
-        btfss   bendTableValue,0
-        goto    $+7
-        movf    bendTempL,w
-        addwf   bendAmountL,f
-        movf    bendTempH,w
-        btfsc   STATUS,C
-        incfsz  bendTempH,w
-        addwf   bendAmountH,f
-        
-        ; M = M>>3, arithmetic right shift with round (preserve or restore negative sign)
-        btfss   bendAmountL,2
-        goto    NOROUND     ; no round if bit 3 (last shifted out) is 0
-        movf    bendAmountL,w
-        andlw   0x0F
-        xorlw   0x04
-        btfsc   STATUS,Z
-        goto    NOROUND     ; no round if 4 LSBs are 0100 (including the first one kept)
-        movlw   0x08        ; yes round, add 8 before discarding bits to the right.
-        addwf   bendAmountL,f
-        btfsc   STATUS,C
-        incf    bendAmountH,f
-NOROUND:            ;; 3, 7, or 11 inst rounding
-        ;asr16 bendAmountL,bendAmountH
-        ;asr16 bendAmountL,bendAmountH
-        ;asr16 bendAmountL,bendAmountH        ;; 9 inst right shift
-        rrf     bendAmountH,f
-        rrf     bendAmountL,f
-        rrf     bendAmountH,f
-        rrf     bendAmountL,f
-        rrf     bendAmountH,f
-        rrf     bendAmountL,f
-        ; Make sure bendAmount stays negative by setting the upper 3 bits
-        movlw   0xE0
-        iorwf   bendAmountH,f
-        
-        ; N = signum(G)?N-(M>>3):N+(M>>3)
-        movf    bendAmountL,w
-        btfss   bendTableValue,7
-        goto    ADDN
-SUBN:
-        ;sub16 bendAmountL,bendAmountH,tempPreloadL,tempPreloadH
-        ;movf    bendAmountL,w
-        subwf   tempPreloadL,f
-        movf    bendAmountH,w
-        btfss   STATUS,C
-        incfsz  bendAmountH,w
-        subwf   tempPreloadH,f 
-        return
-ADDN:
-        ;add16 bendAmountL,bendAmountH,tempPreloadL,tempPreloadH
-        ;movf    bendAmountL,w
-        addwf   tempPreloadL,f
-        movf    bendAmountH,w
-        btfsc   STATUS,C
-        incfsz  bendAmountH,w
-        addwf   tempPreloadH,f
-        return
-
-
 
     ORG     0x0200
 
@@ -1120,7 +1099,186 @@ ToneTableMSB:
 ;}
 ;-----------------------------------
 
-    ORG     0x0300
+CalculatePitchPeriod:
+    ; WREG contains the preload table index
+    ; Retrieve the note table
+    ; Then apply pitch bend
+        movwf   tableAddress
+        call    ToneTableLSB
+        movwf   tempPreloadL
+        movf    tableAddress,w
+        call    ToneTableMSB
+        movwf   tempPreloadH
+
+    ; Calculate new pitch bend from vibrato and bend commands
+        movf    pitchBendValue,w
+        addwf   vibratoBendValue,w
+        movwf   noteBendValue
+
+        xorlw   0x40
+        btfsc   STATUS,Z
+        return                  ; If total bend value is 64, no modification is needed
+
+        movf    noteBendValue,w
+        call    PitchBendTable
+        movwf   bendTableValue
+
+        ; Clear M variable, the modifier accumulator
+        clrf    bendAmountL
+        clrf    bendAmountH
+        ; Copy N>>1 into temporary shift register, so we know it's negative
+        ; We'll be discarding lower bits during the multiplication, 
+        ;   so only using 16 bits for shift and accumulate
+        bsf     STATUS,C        ; set the correct sign bit and divide by 2
+        rrf     tempPreloadH,w
+        movwf   bendTempH
+        rrf     tempPreloadL,w
+        movwf   bendTempL
+        btfsc   tempPreloadL,0        ; round bendTempH:bendTempL up if tempPreloadL ended in 11 before shifting
+        btfss   tempPreloadL,1
+        goto    SL_NOROUND
+        incf    bendTempL,f
+        btfsc   STATUS,Z
+        incf    bendTempH,f
+SL_NOROUND:             ;; 11 or 13 inst setup
+        
+        ; Calculate M
+        ; bendTableValue magnitude is always positive
+        ; bendTemp is always negative (because ToneTable value is always negative)
+        ; bendAmount always negative
+        ; bendAmount is either added to or subtracted from tempPreload based on bendTableValue sign
+        
+        ;negmac16r  bendTableValue,6,bendTempL,bendTempH,bendAmountL,bendAmountH
+        btfss   bendTableValue,6
+        goto    $+5
+        movf    bendTempL,w     ; bendAmount is always 0 at this stage, just overwrite it
+        movwf   bendAmountL
+        movf    bendTempH,w
+        movwf   bendAmountH
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16r  bendTableValue,5,bendTempL,bendTempH,bendAmountL,bendAmountH    
+        btfss   bendTableValue,5
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16r  bendTableValue,4,bendTempL,bendTempH,bendAmountL,bendAmountH 
+        btfss   bendTableValue,4
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16r  bendTableValue,3,bendTempL,bendTempH,bendAmountL,bendAmountH    ;; 44 inst first half multiply
+        btfss   bendTableValue,3
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16r  bendTableValue,2,bendTempL,bendTempH,bendAmountL,bendAmountH
+        btfss   bendTableValue,2
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16r  bendTableValue,1,bendTempL,bendTempH,bendAmountL,bendAmountH
+        btfss   bendTableValue,1
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        bsf     STATUS,C
+        rrf     bendTempH,f
+        rrf     bendTempL,f
+        ;negmac16   bendTableValue,0,bendTempL,bendTempH,bendAmountL,bendAmountH    ;; 30 inst second half multiply
+        btfss   bendTableValue,0
+        goto    $+7
+        movf    bendTempL,w
+        addwf   bendAmountL,f
+        movf    bendTempH,w
+        btfsc   STATUS,C
+        incfsz  bendTempH,w
+        addwf   bendAmountH,f
+        
+        ; M = M>>3, arithmetic right shift with round (preserve or restore negative sign)
+        btfss   bendAmountL,2
+        goto    NOROUND     ; no round if bit 3 (last shifted out) is 0
+        movf    bendAmountL,w
+        andlw   0x0F
+        xorlw   0x04
+        btfsc   STATUS,Z
+        goto    NOROUND     ; no round if 4 LSBs are 0100 (including the first one kept)
+        movlw   0x08        ; yes round, add 8 before discarding bits to the right.
+        addwf   bendAmountL,f
+        btfsc   STATUS,C
+        incf    bendAmountH,f
+NOROUND:            ;; 3, 7, or 11 inst rounding
+        ;asr16 bendAmountL,bendAmountH
+        ;asr16 bendAmountL,bendAmountH
+        ;asr16 bendAmountL,bendAmountH        ;; 9 inst right shift
+        rrf     bendAmountH,f
+        rrf     bendAmountL,f
+        rrf     bendAmountH,f
+        rrf     bendAmountL,f
+        rrf     bendAmountH,f
+        rrf     bendAmountL,f
+        ; Make sure bendAmount stays negative by setting the upper 3 bits
+        movlw   0xE0
+        iorwf   bendAmountH,f
+        
+        ; N = signum(G)?N-(M>>3):N+(M>>3)
+        movf    bendAmountL,w
+        btfss   bendTableValue,7
+        goto    ADDN
+SUBN:
+        ;sub16 bendAmountL,bendAmountH,tempPreloadL,tempPreloadH
+        ;movf    bendAmountL,w
+        subwf   tempPreloadL,f
+        movf    bendAmountH,w
+        btfss   STATUS,C
+        incfsz  bendAmountH,w
+        subwf   tempPreloadH,f 
+        return
+ADDN:
+        ;add16 bendAmountL,bendAmountH,tempPreloadL,tempPreloadH
+        ;movf    bendAmountL,w
+        addwf   tempPreloadL,f
+        movf    bendAmountH,w
+        btfsc   STATUS,C
+        incfsz  bendAmountH,w
+        addwf   tempPreloadH,f
+        return
+
+
+;    ORG     0x0300
 
 PitchBendTable:
 ;{
